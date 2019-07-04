@@ -195,7 +195,7 @@ var _ = DescribeTable("Input resolving",
 		},
 	}),
 
-	Entry("relint rc high cpu regression test", Example{
+	FEntry("relint rc high cpu regression test", Example{
 		LoadDB: "testdata/relint-versions-2.json.gz",
 
 		Inputs: Inputs{

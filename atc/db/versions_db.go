@@ -13,7 +13,7 @@ import (
 	gocache "github.com/patrickmn/go-cache"
 )
 
-const algorithmLimitRows = 100
+const algorithmLimitRows = 2
 
 type JobNotFoundError struct {
 	ID int
@@ -63,7 +63,7 @@ func (versions VersionsDB) LatestVersionOfResource(resourceID int) (ResourceVers
 	return version, true, nil
 }
 
-func (versions VersionsDB) SuccessfulBuilds(jobID int) PaginatedBuilds {
+func (versions VersionsDB) SuccessfulBuilds(paginatedBuilds *PaginatedBuilds, jobID int) {
 	builder := psql.Select("b.id").
 		From("builds b").
 		Where(sq.Eq{
@@ -72,16 +72,14 @@ func (versions VersionsDB) SuccessfulBuilds(jobID int) PaginatedBuilds {
 		}).
 		OrderBy("b.id DESC")
 
-	return PaginatedBuilds{
-		builder:            builder,
-		column:             "b.id",
-		cacheBuildIDCursor: 0,
+	paginatedBuilds.passedJobsBuilder[jobID] = builder
+	paginatedBuilds.column = "b.id"
+	paginatedBuilds.conn = versions.Conn
 
-		conn: versions.Conn,
-	}
+	return
 }
 
-func (versions VersionsDB) SuccessfulBuildsVersionConstrained(jobID int, version ResourceVersion, resourceID int) PaginatedBuilds {
+func (versions VersionsDB) SuccessfulBuildsVersionConstrained(paginatedBuilds *PaginatedBuilds, jobID int, version ResourceVersion, resourceID int) {
 	builder := psql.Select("build_id").
 		From("successful_build_versions").
 		Where(sq.Eq{
@@ -91,13 +89,11 @@ func (versions VersionsDB) SuccessfulBuildsVersionConstrained(jobID int, version
 		}).
 		OrderBy("build_id DESC")
 
-	return PaginatedBuilds{
-		builder:            builder,
-		column:             "build_id",
-		cacheBuildIDCursor: 0,
+	paginatedBuilds.passedJobsBuilder[jobID] = builder
+	paginatedBuilds.column = "build_id"
+	paginatedBuilds.conn = versions.Conn
 
-		conn: versions.Conn,
-	}
+	return
 }
 
 func (versions VersionsDB) BuildOutputs(buildID int) ([]AlgorithmOutput, error) {
@@ -357,9 +353,8 @@ func (versions VersionsDB) LatestBuildPipes(buildID int, passedJobs map[int]bool
 	return jobToBuildPipes, nil
 }
 
-func (versions VersionsDB) UnusedBuilds(buildID int, jobID int) (PaginatedBuilds, error) {
-	var buildIDs []int
-	rows, err := psql.Select("id").
+func (versions VersionsDB) UnusedBuilds(paginatedBuilds *PaginatedBuilds, buildID int, jobID int) error {
+	preBuilder := psql.Select("id").
 		From("builds").
 		Where(sq.And{
 			sq.Gt{"id": buildID},
@@ -368,21 +363,7 @@ func (versions VersionsDB) UnusedBuilds(buildID int, jobID int) (PaginatedBuilds
 				"status": "succeeded",
 			},
 		}).
-		OrderBy("id ASC").
-		Limit(algorithmLimitRows).
-		RunWith(versions.Conn).
-		Query()
-
-	for rows.Next() {
-		var buildID int
-
-		err = rows.Scan(&buildID)
-		if err != nil {
-			return PaginatedBuilds{}, err
-		}
-
-		buildIDs = append(buildIDs, buildID)
-	}
+		OrderBy("id ASC")
 
 	builder := psql.Select("id").
 		From("builds").
@@ -395,19 +376,16 @@ func (versions VersionsDB) UnusedBuilds(buildID int, jobID int) (PaginatedBuilds
 		}).
 		OrderBy("id DESC")
 
-	return PaginatedBuilds{
-		builder:            builder,
-		buildIDs:           buildIDs,
-		column:             "id",
-		cacheBuildIDCursor: 0,
+	paginatedBuilds.passedJobsPreBuilder[jobID] = preBuilder
+	paginatedBuilds.passedJobsBuilder[jobID] = builder
+	paginatedBuilds.column = "id"
+	paginatedBuilds.conn = versions.Conn
 
-		conn: versions.Conn,
-	}, nil
+	return nil
 }
 
-func (versions VersionsDB) UnusedBuildsVersionConstrained(buildID int, jobID int, version ResourceVersion, resourceID int) (PaginatedBuilds, error) {
-	var buildIDs []int
-	rows, err := psql.Select("build_id").
+func (versions VersionsDB) UnusedBuildsVersionConstrained(paginatedBuilds *PaginatedBuilds, buildID int, jobID int, version ResourceVersion, resourceID int) error {
+	preBuilder := psql.Select("build_id").
 		From("successful_build_versions").
 		Where(sq.Eq{
 			"job_id":      jobID,
@@ -417,19 +395,7 @@ func (versions VersionsDB) UnusedBuildsVersionConstrained(buildID int, jobID int
 		Where(sq.Gt{
 			"build_id": buildID,
 		}).
-		OrderBy("build_id ASC").
-		RunWith(versions.Conn).
-		Query()
-	for rows.Next() {
-		var buildID int
-
-		err = rows.Scan(&buildID)
-		if err != nil {
-			return PaginatedBuilds{}, err
-		}
-
-		buildIDs = append(buildIDs, buildID)
-	}
+		OrderBy("build_id ASC")
 
 	builder := psql.Select("build_id").
 		From("successful_build_versions").
@@ -443,15 +409,12 @@ func (versions VersionsDB) UnusedBuildsVersionConstrained(buildID int, jobID int
 		}).
 		OrderBy("build_id DESC")
 
-	return PaginatedBuilds{
-		builder:            builder,
-		buildIDs:           buildIDs,
-		column:             "build_id",
-		cacheBuildIDCursor: 0,
+	paginatedBuilds.passedJobsPreBuilder[jobID] = preBuilder
+	paginatedBuilds.passedJobsBuilder[jobID] = builder
+	paginatedBuilds.column = "build_id"
+	paginatedBuilds.conn = versions.Conn
 
-		conn: versions.Conn,
-	}, nil
-
+	return nil
 }
 
 func (versions VersionsDB) OrderPassedJobs(currentJobID int, jobs JobSet) ([]int, error) {
@@ -548,33 +511,67 @@ func (versions VersionsDB) latestVersionOfResource(tx Tx, resourceID int) (Resou
 }
 
 type PaginatedBuilds struct {
-	builder sq.SelectBuilder
-	column  string
+	passedJobsBuilder    map[int]sq.SelectBuilder
+	passedJobsPreBuilder map[int]sq.SelectBuilder
+	column               string
 
-	cacheBuildIDCursor int
+	passedJobsBuildIDs map[int][]int
+	offset             int
 
-	buildIDs []int
-	offset   int
+	currentJob int
 
 	conn Conn
 }
 
-func (bs *PaginatedBuilds) Next(debug func(messages ...interface{})) (int, bool, error) {
-	debug("current offset", bs.offset, "build len", len(bs.buildIDs))
-	if bs.offset+1 > len(bs.buildIDs) {
-		builder := bs.builder
+func NewPaginatedBuilds() *PaginatedBuilds {
+	return &PaginatedBuilds{
+		passedJobsBuilder:    map[int]sq.SelectBuilder{},
+		passedJobsPreBuilder: map[int]sq.SelectBuilder{},
+		passedJobsBuildIDs:   map[int][]int{},
+	}
+}
 
-		if len(bs.buildIDs) > 0 {
-			builder = bs.builder.Where(sq.Lt{
-				bs.column: bs.buildIDs[len(bs.buildIDs)-1],
+func (bs *PaginatedBuilds) CurrentPassedJobID() int {
+	return bs.currentJob
+}
+
+func (bs *PaginatedBuilds) Next(debug func(messages ...interface{}), orderedJobs []int) (int, bool, error) {
+	debug("current offset", bs.offset, "build len", len(bs.passedJobsBuildIDs[bs.currentJob]))
+	if bs.offset+1 > len(bs.passedJobsBuildIDs[bs.currentJob]) {
+		if bs.currentJob == 0 || bs.currentJob == orderedJobs[len(orderedJobs)-1] {
+			bs.currentJob = orderedJobs[0]
+		} else {
+			for i, job := range orderedJobs {
+				if job == bs.currentJob {
+					bs.currentJob = orderedJobs[i+1]
+					break
+				}
+			}
+		}
+		debug("current job", bs.currentJob)
+
+		preQuery := false
+		builder := bs.passedJobsBuilder[bs.currentJob]
+		if len(bs.passedJobsBuildIDs[bs.currentJob]) == 0 {
+			if _, ok := bs.passedJobsPreBuilder[bs.currentJob]; ok {
+				builder = bs.passedJobsPreBuilder[bs.currentJob]
+				delete(bs.passedJobsPreBuilder, bs.currentJob)
+				preQuery = true
+			}
+		} else {
+			builder = builder.Where(sq.Lt{
+				bs.column: bs.passedJobsBuildIDs[bs.currentJob][len(bs.passedJobsBuildIDs[bs.currentJob])-1],
 			})
 		}
 
-		bs.buildIDs = []int{}
+		if !preQuery {
+			builder = builder.Limit(algorithmLimitRows)
+		}
+
+		bs.passedJobsBuildIDs[bs.currentJob] = []int{}
 		bs.offset = 0
 
 		rows, err := builder.
-			Limit(algorithmLimitRows).
 			RunWith(bs.conn).
 			Query()
 		if err != nil {
@@ -589,21 +586,21 @@ func (bs *PaginatedBuilds) Next(debug func(messages ...interface{})) (int, bool,
 				return 0, false, err
 			}
 
-			bs.buildIDs = append(bs.buildIDs, buildID)
+			bs.passedJobsBuildIDs[bs.currentJob] = append(bs.passedJobsBuildIDs[bs.currentJob], buildID)
 		}
 
-		debug("found", len(bs.buildIDs), "builds in successful")
+		debug("found", len(bs.passedJobsBuildIDs[bs.currentJob]), "builds in successful")
 
-		if len(bs.buildIDs) != 0 {
-			bs.cacheBuildIDCursor = bs.buildIDs[len(bs.buildIDs)-1]
-		}
-
-		if len(bs.buildIDs) == 0 {
-			return 0, false, nil
+		if len(bs.passedJobsBuildIDs[bs.currentJob]) == 0 {
+			if preQuery == true {
+				return bs.Next(debug, orderedJobs)
+			} else {
+				return 0, false, nil
+			}
 		}
 	}
 
-	id := bs.buildIDs[bs.offset]
+	id := bs.passedJobsBuildIDs[bs.currentJob][bs.offset]
 	bs.offset++
 
 	return id, true, nil
