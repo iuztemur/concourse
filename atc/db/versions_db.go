@@ -13,8 +13,6 @@ import (
 	gocache "github.com/patrickmn/go-cache"
 )
 
-const algorithmLimitRows = 2
-
 type JobNotFoundError struct {
 	ID int
 }
@@ -24,7 +22,8 @@ func (e JobNotFoundError) Error() string {
 }
 
 type VersionsDB struct {
-	Conn Conn
+	Conn      Conn
+	LimitRows int
 
 	Cache *gocache.Cache
 
@@ -75,12 +74,13 @@ func (versions VersionsDB) SuccessfulBuilds(paginatedBuilds *PaginatedBuilds, jo
 	paginatedBuilds.passedJobsBuilder[jobID] = builder
 	paginatedBuilds.column = "b.id"
 	paginatedBuilds.conn = versions.Conn
+	paginatedBuilds.limitRows = versions.LimitRows
 
 	return
 }
 
 func (versions VersionsDB) SuccessfulBuildsVersionConstrained(paginatedBuilds *PaginatedBuilds, jobID int, version ResourceVersion, resourceID int) {
-	builder := psql.Select("build_id").
+	builder := psql.Select("DISTINCT build_id").
 		From("successful_build_versions").
 		Where(sq.Eq{
 			"job_id":      jobID,
@@ -92,6 +92,7 @@ func (versions VersionsDB) SuccessfulBuildsVersionConstrained(paginatedBuilds *P
 	paginatedBuilds.passedJobsBuilder[jobID] = builder
 	paginatedBuilds.column = "build_id"
 	paginatedBuilds.conn = versions.Conn
+	paginatedBuilds.limitRows = versions.LimitRows
 
 	return
 }
@@ -156,9 +157,8 @@ func (versions VersionsDB) SuccessfulBuildOutputs(buildID int) ([]AlgorithmOutpu
 		return c.([]AlgorithmOutput), nil
 	}
 
-	uniqOutputs := map[string]AlgorithmOutput{}
 	// TODO: prefer outputs over inputs for the same name
-	rows, err := psql.Select("name", "resource_id", "version_md5").
+	rows, err := psql.Select("name", "resource_id", "version_md5", "output").
 		From("successful_build_versions").
 		Where(sq.Eq{"build_id": buildID}).
 		RunWith(versions.Conn).
@@ -167,14 +167,21 @@ func (versions VersionsDB) SuccessfulBuildOutputs(buildID int) ([]AlgorithmOutpu
 		return nil, err
 	}
 
+	uniqOutputs := map[string]AlgorithmOutput{}
+	uniqInputs := map[string]AlgorithmOutput{}
 	for rows.Next() {
 		var output AlgorithmOutput
-		err := rows.Scan(&output.InputName, &output.ResourceID, &output.Version)
+		var outputType bool
+		err := rows.Scan(&output.InputName, &output.ResourceID, &output.Version, &outputType)
 		if err != nil {
 			return nil, err
 		}
 
-		uniqOutputs[output.InputName] = output
+		if outputType == true {
+			uniqOutputs[output.InputName] = output
+		} else {
+			uniqInputs[output.InputName] = output
+		}
 	}
 
 	outputs := []AlgorithmOutput{}
@@ -182,13 +189,24 @@ func (versions VersionsDB) SuccessfulBuildOutputs(buildID int) ([]AlgorithmOutpu
 		outputs = append(outputs, o)
 	}
 
+	inputs := []AlgorithmOutput{}
+	for _, i := range uniqInputs {
+		inputs = append(inputs, i)
+	}
+
 	sort.Slice(outputs, func(i, j int) bool {
 		return outputs[i].InputName > outputs[j].InputName
 	})
 
-	versions.Cache.Set(cacheKey, outputs, time.Hour)
+	sort.Slice(inputs, func(i, j int) bool {
+		return inputs[i].InputName > inputs[j].InputName
+	})
 
-	return outputs, nil
+	finalOutputs := append(outputs, inputs...)
+
+	versions.Cache.Set(cacheKey, finalOutputs, time.Hour)
+
+	return finalOutputs, nil
 }
 
 func (versions VersionsDB) FindVersionOfResource(resourceID int, v atc.Version) (ResourceVersion, bool, error) {
@@ -380,12 +398,13 @@ func (versions VersionsDB) UnusedBuilds(paginatedBuilds *PaginatedBuilds, buildI
 	paginatedBuilds.passedJobsBuilder[jobID] = builder
 	paginatedBuilds.column = "id"
 	paginatedBuilds.conn = versions.Conn
+	paginatedBuilds.limitRows = versions.LimitRows
 
 	return nil
 }
 
 func (versions VersionsDB) UnusedBuildsVersionConstrained(paginatedBuilds *PaginatedBuilds, buildID int, jobID int, version ResourceVersion, resourceID int) error {
-	preBuilder := psql.Select("build_id").
+	preBuilder := psql.Select("DISTINCT build_id").
 		From("successful_build_versions").
 		Where(sq.Eq{
 			"job_id":      jobID,
@@ -397,7 +416,7 @@ func (versions VersionsDB) UnusedBuildsVersionConstrained(paginatedBuilds *Pagin
 		}).
 		OrderBy("build_id ASC")
 
-	builder := psql.Select("build_id").
+	builder := psql.Select("DISTINCT build_id").
 		From("successful_build_versions").
 		Where(sq.Eq{
 			"job_id":      jobID,
@@ -413,6 +432,7 @@ func (versions VersionsDB) UnusedBuildsVersionConstrained(paginatedBuilds *Pagin
 	paginatedBuilds.passedJobsBuilder[jobID] = builder
 	paginatedBuilds.column = "build_id"
 	paginatedBuilds.conn = versions.Conn
+	paginatedBuilds.limitRows = versions.LimitRows
 
 	return nil
 }
@@ -520,7 +540,8 @@ type PaginatedBuilds struct {
 
 	currentJob int
 
-	conn Conn
+	conn      Conn
+	limitRows int
 }
 
 func NewPaginatedBuilds() *PaginatedBuilds {
@@ -565,7 +586,7 @@ func (bs *PaginatedBuilds) Next(debug func(messages ...interface{}), orderedJobs
 		}
 
 		if !preQuery {
-			builder = builder.Limit(algorithmLimitRows)
+			builder = builder.Limit(uint64(bs.limitRows))
 		}
 
 		bs.passedJobsBuildIDs[bs.currentJob] = []int{}

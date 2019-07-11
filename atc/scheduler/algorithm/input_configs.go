@@ -3,8 +3,6 @@ package algorithm
 import (
 	"errors"
 	"fmt"
-	"log"
-	"strings"
 
 	"github.com/concourse/concourse/atc"
 	"github.com/concourse/concourse/atc/db"
@@ -238,14 +236,14 @@ func (im *inputMapper) tryResolve(depth int, vdb *db.VersionsDB, inputConfigs In
 
 	for i, inputConfig := range inputConfigs {
 		debug := func(messages ...interface{}) {
-			log.Println(
-				append(
-					[]interface{}{
-						strings.Repeat("-", depth) + fmt.Sprintf("[%s]", inputConfig.Name),
-					},
-					messages...,
-				)...,
-			)
+			// log.Println(
+			// 	append(
+			// 		[]interface{}{
+			// 			strings.Repeat("-", depth) + fmt.Sprintf("[%s]", inputConfig.Name),
+			// 		},
+			// 		messages...,
+			// 	)...,
+			// )
 		}
 
 		if len(inputConfig.Passed) == 0 {
@@ -254,59 +252,17 @@ func (im *inputMapper) tryResolve(depth int, vdb *db.VersionsDB, inputConfigs In
 				continue
 			}
 
-			var version db.ResourceVersion
-			if inputConfig.PinnedVersion != "" {
-				// pinned
-				version = inputConfig.PinnedVersion
-				debug("setting candidate", i, "to unconstrained version", version)
-			} else if inputConfig.UseEveryVersion {
-				buildID, found, err := vdb.LatestBuildID(inputConfig.JobID)
-				if err != nil {
-					return false, err
-				}
-
-				if found {
-					version, found, err = vdb.NextEveryVersion(buildID, inputConfig.ResourceID)
-					if err != nil {
-						return false, err
-					}
-
-					if !found {
-						unresolvedCandidates[i] = newCandidateError(ErrVersionNotFound)
-						return false, nil
-					}
-				} else {
-					version, found, err = vdb.LatestVersionOfResource(inputConfig.ResourceID)
-					if err != nil {
-						return false, err
-					}
-
-					if !found {
-						unresolvedCandidates[i] = newCandidateError(ErrLatestVersionNotFound)
-						return false, nil
-					}
-				}
-
-				debug("setting candidate", i, "to version for version every", version, " resource ", inputConfig.ResourceID)
-			} else {
-				// there are no passed constraints, so just take the latest version
-				var err error
-				var found bool
-				version, found, err = vdb.LatestVersionOfResource(inputConfig.ResourceID)
-				if err != nil {
-					return false, nil
-				}
-
-				if !found {
-					unresolvedCandidates[i] = newCandidateError(ErrLatestVersionNotFound)
-					return false, nil
-				}
-
-				debug("setting candidate", i, "to version for latest", version)
+			cand, unresolvedCandidate, found, err := im.determineVersionWithNoPassedConstraints(debug, vdb, inputConfig)
+			unresolvedCandidates[i] = unresolvedCandidate
+			if err != nil {
+				return false, err
 			}
 
-			candidates[i] = newCandidateVersion(version)
-			unresolvedCandidates[i] = newCandidateVersion(version)
+			if !found {
+				return false, nil
+			}
+
+			candidates[i] = cand
 			continue
 		}
 
@@ -321,74 +277,17 @@ func (im *inputMapper) tryResolve(depth int, vdb *db.VersionsDB, inputConfigs In
 
 		jobToBuildPipes := map[int]int{}
 		if inputConfig.UseEveryVersion {
-			buildID, found, err := vdb.LatestBuildID(inputConfig.JobID)
+			var err error
+			jobToBuildPipes, err = im.fetchLatestBuildPipesForPassedConstraints(vdb, inputConfig)
 			if err != nil {
 				return false, err
 			}
-
-			if found {
-				jobToBuildPipes, err = vdb.LatestBuildPipes(buildID, inputConfig.Passed)
-				if err != nil {
-					return false, err
-				}
-			}
 		}
 
-		nextPaginatedJobs := []int{}
 		paginatedBuilds := db.NewPaginatedBuilds()
-		for _, jobID := range orderedJobs {
-			if candidates[i] != nil {
-				debug(i, "has a candidate")
-
-				// coming from recursive call; we've already got a candidate
-				if candidates[i].VouchedForBy[jobID] {
-					debug("job", jobID, i, "already vouched for", candidates[i].Version)
-					// we've already been here; continue to the next job
-					continue
-				} else {
-					debug("job", jobID, i, "has not vouched for", candidates[i].Version)
-				}
-			} else {
-				debug(i, "has no candidate yet")
-			}
-
-			// loop over previous output sets, latest first
-			passedBuildFound := false
-			if inputConfig.UseEveryVersion && len(jobToBuildPipes) != 0 {
-				var constraintBuildID int
-				constraintBuildID, passedBuildFound = jobToBuildPipes[jobID]
-				if passedBuildFound {
-					var err error
-					if candidates[i] != nil {
-						err = vdb.UnusedBuildsVersionConstrained(paginatedBuilds, constraintBuildID, jobID, candidates[i].Version, inputConfig.ResourceID)
-					} else {
-						err = vdb.UnusedBuilds(paginatedBuilds, constraintBuildID, jobID)
-					}
-					if err != nil {
-						return false, err
-					}
-				} else if candidates[i] == nil {
-					// we've run with version: every and passed: before, just not with
-					// this job, and there's no candidate yet, so skip it for now and let
-					// the algorithm continue from where the other jobs left off rather
-					// than starting from 'latest'
-					//
-					// this job will eventually vouch for it during the recursive resolve
-					// call
-					debug("skipped job because current job has not run with passed job before", jobID)
-					continue
-				}
-			}
-
-			if !inputConfig.UseEveryVersion || !passedBuildFound {
-				if candidates[i] != nil {
-					vdb.SuccessfulBuildsVersionConstrained(paginatedBuilds, jobID, candidates[i].Version, inputConfig.ResourceID)
-				} else {
-					vdb.SuccessfulBuilds(paginatedBuilds, jobID)
-				}
-			}
-
-			nextPaginatedJobs = append(nextPaginatedJobs, jobID)
+		nextPaginatedJobs, err := im.setUpPaginatedBuildsQueries(debug, vdb, inputConfig, candidates[i], paginatedBuilds, orderedJobs, jobToBuildPipes)
+		if err != nil {
+			return false, err
 		}
 
 		if len(nextPaginatedJobs) != 0 {
@@ -461,9 +360,14 @@ func (im *inputMapper) tryResolve(depth int, vdb *db.VersionsDB, inputConfigs In
 						if candidate != nil && candidate.Version != output.Version {
 							// don't return here! just try the next output set. it's possible
 							// we just need to use an older output set.
-							debug("mismatch")
+							debug("mismatch candidate version", candidate.Version, "comparing to output version", output.Version)
 							mismatch = true
 							break outputs
+						}
+
+						if _, ok := restore[c]; ok {
+							// have already set a new version for this candidate within this build, so skip
+							continue
 						}
 
 						// if this doesn't work out, restore it to either nil or the
@@ -478,6 +382,12 @@ func (im *inputMapper) tryResolve(depth int, vdb *db.VersionsDB, inputConfigs In
 						if candidate != nil {
 							for vJobID := range candidate.VouchedForBy {
 								candidates[c].VouchedForBy[vJobID] = true
+							}
+
+							if len(candidate.SourceBuildIds) != 0 {
+								for _, sourceBuildId := range candidate.SourceBuildIds {
+									candidates[c].SourceBuildIds = append(candidates[c].SourceBuildIds, sourceBuildId)
+								}
 							}
 						}
 
@@ -525,4 +435,138 @@ func (im *inputMapper) tryResolve(depth int, vdb *db.VersionsDB, inputConfigs In
 
 	// go to the end of all the inputs
 	return true, nil
+}
+
+func (im *inputMapper) determineVersionWithNoPassedConstraints(debug func(messages ...interface{}), vdb *db.VersionsDB, inputConfig InputConfig) (*versionCandidate, *versionCandidate, bool, error) {
+	var version db.ResourceVersion
+
+	if inputConfig.PinnedVersion != "" {
+		// pinned
+		debug("setting candidate", inputConfig.Name, "to unconstrained version", inputConfig.PinnedVersion)
+		version = inputConfig.PinnedVersion
+	} else if inputConfig.UseEveryVersion {
+		buildID, found, err := vdb.LatestBuildID(inputConfig.JobID)
+		if err != nil {
+			return nil, nil, false, err
+		}
+
+		if found {
+			version, found, err = vdb.NextEveryVersion(buildID, inputConfig.ResourceID)
+			if err != nil {
+				return nil, nil, false, err
+			}
+
+			if !found {
+				return nil, newCandidateError(ErrVersionNotFound), false, nil
+			}
+		} else {
+			version, found, err = vdb.LatestVersionOfResource(inputConfig.ResourceID)
+			if err != nil {
+				return nil, nil, false, err
+			}
+
+			if !found {
+				return nil, newCandidateError(ErrLatestVersionNotFound), false, nil
+			}
+		}
+
+		debug("setting candidate", inputConfig.Name, "to version for version every", version, " resource ", inputConfig.ResourceID)
+	} else {
+		// there are no passed constraints, so just take the latest version
+		var err error
+		var found bool
+		version, found, err = vdb.LatestVersionOfResource(inputConfig.ResourceID)
+		if err != nil {
+			return nil, nil, false, nil
+		}
+
+		if !found {
+			return nil, newCandidateError(ErrLatestVersionNotFound), false, nil
+		}
+
+		debug("setting candidate", inputConfig.Name, "to version for latest", version)
+	}
+
+	return newCandidateVersion(version), newCandidateVersion(version), true, nil
+}
+
+func (im *inputMapper) fetchLatestBuildPipesForPassedConstraints(vdb *db.VersionsDB, inputConfig InputConfig) (map[int]int, error) {
+	buildID, found, err := vdb.LatestBuildID(inputConfig.JobID)
+	if err != nil {
+		return nil, err
+	}
+
+	jobToBuildPipes := map[int]int{}
+	if found {
+		jobToBuildPipes, err = vdb.LatestBuildPipes(buildID, inputConfig.Passed)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return jobToBuildPipes, nil
+}
+
+func (im *inputMapper) setUpPaginatedBuildsQueries(debug func(messages ...interface{}), vdb *db.VersionsDB, inputConfig InputConfig, candidate *versionCandidate, paginatedBuilds *db.PaginatedBuilds, orderedJobs []int, jobToBuildPipes map[int]int) ([]int, error) {
+	nextPaginatedJobs := []int{}
+	for _, jobID := range orderedJobs {
+		if candidate != nil {
+			debug(inputConfig.Name, "has a candidate")
+
+			// coming from recursive call; we've already got a candidate
+			if candidate.VouchedForBy[jobID] {
+				debug("job", jobID, inputConfig.Name, "already vouched for", candidate.Version)
+				// we've already been here; continue to the next job
+				continue
+			} else {
+				debug("job", jobID, inputConfig.Name, "has not vouched for", candidate.Version)
+			}
+		} else {
+			debug(inputConfig.Name, "has no candidate yet")
+		}
+
+		// loop over previous output sets, latest first
+		passedBuildFound := false
+		if inputConfig.UseEveryVersion && len(jobToBuildPipes) != 0 {
+			var constraintBuildID int
+			constraintBuildID, passedBuildFound = jobToBuildPipes[jobID]
+			if passedBuildFound {
+				var err error
+				if candidate != nil {
+					err = vdb.UnusedBuildsVersionConstrained(paginatedBuilds, constraintBuildID, jobID, candidate.Version, inputConfig.ResourceID)
+					debug("unused builds with version constrained", jobID, "version", candidate.Version)
+				} else {
+					err = vdb.UnusedBuilds(paginatedBuilds, constraintBuildID, jobID)
+					debug("unused builds", jobID)
+				}
+				if err != nil {
+					return nil, err
+				}
+			} else if candidate == nil {
+				// we've run with version: every and passed: before, just not with
+				// this job, and there's no candidate yet, so skip it for now and let
+				// the algorithm continue from where the other jobs left off rather
+				// than starting from 'latest'
+				//
+				// this job will eventually vouch for it during the recursive resolve
+				// call
+				debug("skipped job because current job has not run with passed job before", jobID)
+				continue
+			}
+		}
+
+		if !inputConfig.UseEveryVersion || !passedBuildFound {
+			if candidate != nil {
+				vdb.SuccessfulBuildsVersionConstrained(paginatedBuilds, jobID, candidate.Version, inputConfig.ResourceID)
+				debug("successful builds version constrained", jobID, "version", candidate.Version)
+			} else {
+				vdb.SuccessfulBuilds(paginatedBuilds, jobID)
+				debug("successful builds", jobID)
+			}
+		}
+
+		nextPaginatedJobs = append(nextPaginatedJobs, jobID)
+	}
+
+	return nextPaginatedJobs, nil
 }

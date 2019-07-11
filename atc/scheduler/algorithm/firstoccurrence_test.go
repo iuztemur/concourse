@@ -126,8 +126,8 @@ var _ = Describe("Resolve", func() {
 
 			jobID := setup.jobIDs.ID(buildInput.JobName)
 			_, err = setup.psql.Insert("successful_build_versions").
-				Columns("build_id", "resource_id", "version_md5", "job_id", "name").
-				Values(buildInput.BuildID, resourceID, sq.Expr("md5(?)", versionJSON), jobID, buildInput.InputName).
+				Columns("build_id", "resource_id", "version_md5", "job_id", "name", "output").
+				Values(buildInput.BuildID, resourceID, sq.Expr("md5(?)", versionJSON), jobID, buildInput.InputName, false).
 				Suffix("ON CONFLICT DO NOTHING").
 				Exec()
 			Expect(err).ToNot(HaveOccurred())
@@ -159,8 +159,8 @@ var _ = Describe("Resolve", func() {
 
 			jobID := setup.jobIDs.ID(buildOutput.JobName)
 			_, err = setup.psql.Insert("successful_build_versions").
-				Columns("build_id", "resource_id", "version_md5", "job_id", "name").
-				Values(buildOutput.BuildID, resourceID, sq.Expr("md5(?)", versionJSON), jobID, buildOutput.ResourceName).
+				Columns("build_id", "resource_id", "version_md5", "job_id", "name", "output").
+				Values(buildOutput.BuildID, resourceID, sq.Expr("md5(?)", versionJSON), jobID, buildOutput.ResourceName, true).
 				Suffix("ON CONFLICT DO NOTHING").
 				Exec()
 			Expect(err).ToNot(HaveOccurred())

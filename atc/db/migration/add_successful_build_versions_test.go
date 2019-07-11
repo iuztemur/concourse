@@ -27,7 +27,7 @@ var _ = Describe("Add successful build versions", func() {
 
 			db = postgresRunner.OpenDBAtVersion(postMigrationVersion)
 
-			rows, err := db.Query(`SELECT build_id, version_md5, resource_id, job_id, name FROM successful_build_versions`)
+			rows, err := db.Query(`SELECT build_id, version_md5, resource_id, job_id, output, name FROM successful_build_versions`)
 			Expect(err).NotTo(HaveOccurred())
 
 			type successfulBuildVersion struct {
@@ -36,13 +36,14 @@ var _ = Describe("Add successful build versions", func() {
 				resourceID int
 				jobID      int
 				name       string
+				output     bool
 			}
 
 			successfulBuildVersions := []successfulBuildVersion{}
 			for rows.Next() {
 				sb := successfulBuildVersion{}
 
-				err := rows.Scan(&sb.buildID, &sb.versionMD5, &sb.resourceID, &sb.jobID, &sb.name)
+				err := rows.Scan(&sb.buildID, &sb.versionMD5, &sb.resourceID, &sb.jobID, &sb.output, &sb.name)
 				Expect(err).NotTo(HaveOccurred())
 
 				successfulBuildVersions = append(successfulBuildVersions, sb)
@@ -57,6 +58,7 @@ var _ = Describe("Add successful build versions", func() {
 					resourceID: 1,
 					jobID:      1,
 					name:       "build_input1",
+					output:     false,
 				},
 				{
 					buildID:    1,
@@ -64,6 +66,7 @@ var _ = Describe("Add successful build versions", func() {
 					resourceID: 1,
 					jobID:      1,
 					name:       "build_input2",
+					output:     false,
 				},
 				{
 					buildID:    2,
@@ -71,6 +74,7 @@ var _ = Describe("Add successful build versions", func() {
 					resourceID: 1,
 					jobID:      1,
 					name:       "build_input1",
+					output:     false,
 				},
 				{
 					buildID:    5,
@@ -78,6 +82,7 @@ var _ = Describe("Add successful build versions", func() {
 					resourceID: 2,
 					jobID:      1,
 					name:       "build_input4",
+					output:     false,
 				},
 				{
 					buildID:    1,
@@ -85,6 +90,7 @@ var _ = Describe("Add successful build versions", func() {
 					resourceID: 1,
 					jobID:      1,
 					name:       "build_output1",
+					output:     true,
 				},
 				{
 					buildID:    2,
@@ -92,6 +98,7 @@ var _ = Describe("Add successful build versions", func() {
 					resourceID: 1,
 					jobID:      1,
 					name:       "build_output1",
+					output:     true,
 				},
 				{
 					buildID:    2,
@@ -99,6 +106,7 @@ var _ = Describe("Add successful build versions", func() {
 					resourceID: 3,
 					jobID:      1,
 					name:       "build_output2",
+					output:     true,
 				},
 			}
 

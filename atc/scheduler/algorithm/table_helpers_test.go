@@ -63,10 +63,11 @@ type Version struct {
 }
 
 type Result struct {
-	OK      bool
-	Values  map[string]string
-	Errors  map[string]string
-	Skipped map[string]bool
+	OK             bool
+	Values         map[string]string
+	PassedBuildIDs map[string][]int
+	Errors         map[string]string
+	Skipped        map[string]bool
 }
 
 type StringMapping map[string]int
@@ -160,6 +161,8 @@ func (example Example) Run() {
 	resources := map[string]atc.ResourceConfig{}
 
 	if example.LoadDB != "" {
+		versionsDB.LimitRows = 100
+
 		dbFile, err := os.Open(example.LoadDB)
 		Expect(err).ToNot(HaveOccurred())
 
@@ -364,6 +367,8 @@ func (example Example) Run() {
 
 		log.Println("DONE IMPORTING")
 	} else {
+		versionsDB.LimitRows = 2
+
 		for _, row := range example.DB.Resources {
 			setup.insertRowVersion(resources, row)
 		}
@@ -385,8 +390,8 @@ func (example Example) Run() {
 
 			jobID := setup.jobIDs.ID(row.Job)
 			_, err = setup.psql.Insert("successful_build_versions").
-				Columns("build_id", "resource_id", "version_md5", "job_id", "name").
-				Values(row.BuildID, resourceID, sq.Expr("md5(?)", versionJSON), jobID, row.Resource).
+				Columns("build_id", "resource_id", "version_md5", "job_id", "name", "output").
+				Values(row.BuildID, resourceID, sq.Expr("md5(?)", versionJSON), jobID, row.Resource, false).
 				Suffix("ON CONFLICT DO NOTHING").
 				Exec()
 			Expect(err).ToNot(HaveOccurred())
@@ -409,8 +414,8 @@ func (example Example) Run() {
 
 			jobID := setup.jobIDs.ID(row.Job)
 			_, err = setup.psql.Insert("successful_build_versions").
-				Columns("build_id", "resource_id", "version_md5", "job_id", "name").
-				Values(row.BuildID, resourceID, sq.Expr("md5(?)", versionJSON), jobID, row.Resource).
+				Columns("build_id", "resource_id", "version_md5", "job_id", "name", "output").
+				Values(row.BuildID, resourceID, sq.Expr("md5(?)", versionJSON), jobID, row.Resource, true).
 				Suffix("ON CONFLICT DO NOTHING").
 				Exec()
 			Expect(err).ToNot(HaveOccurred())
@@ -576,6 +581,7 @@ func (example Example) Run() {
 		prettyValues := map[string]string{}
 		erroredValues := map[string]string{}
 		skippedValues := map[string]bool{}
+		passedJobs := map[string][]int{}
 		for name, inputSource := range resolved {
 			if inputSource.ResolveSkipped == true {
 				skippedValues[name] = true
@@ -595,6 +601,8 @@ func (example Example) Run() {
 				Expect(err).ToNot(HaveOccurred())
 
 				prettyValues[name] = setup.versionIDs.Name(versionID)
+
+				passedJobs[name] = inputSource.PassedBuildIDs
 			}
 		}
 
@@ -603,13 +611,24 @@ func (example Example) Run() {
 			actualResult.Errors = erroredValues
 		}
 
+		if example.Result.PassedBuildIDs != nil {
+			actualResult.PassedBuildIDs = passedJobs
+		}
+
 		if len(skippedValues) != 0 {
 			actualResult.Skipped = skippedValues
 		}
 
 		actualResult.Values = prettyValues
 
-		Expect(actualResult).To(Equal(example.Result))
+		Expect(actualResult.OK).To(Equal(example.Result.OK))
+		Expect(actualResult.Errors).To(Equal(example.Result.Errors))
+		Expect(actualResult.Values).To(Equal(example.Result.Values))
+		Expect(actualResult.Skipped).To(Equal(example.Result.Skipped))
+
+		for input, buildIDs := range example.Result.PassedBuildIDs {
+			Expect(actualResult.PassedBuildIDs[input]).To(ConsistOf(buildIDs))
+		}
 	}
 }
 
